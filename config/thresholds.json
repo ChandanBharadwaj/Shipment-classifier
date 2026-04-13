@@ -1,0 +1,11 @@
+{
+  "taxonomy_similarity": {
+    "critical": 0.75,
+    "high": 0.78,
+    "medium": 0.80
+  },
+  "routing": {
+    "auto_approve_min_confidence": 0.90,
+    "auto_block_min_confidence": 0.90
+  }
+}

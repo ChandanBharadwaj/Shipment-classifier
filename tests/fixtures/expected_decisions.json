@@ -1,0 +1,27 @@
+{
+  "_comment": "Expected decisions for sample shipments. These serve as test expectations.",
+  "SHIP-001": {
+    "expected_action": "approve",
+    "note": "Toy water pistols should not trigger taxonomy or AI restriction"
+  },
+  "SHIP-004": {
+    "expected_action": "block",
+    "note": "Military weapons should be caught by taxonomy (semantic match)"
+  },
+  "SHIP-005": {
+    "expected_action": "approve",
+    "note": "Cotton t-shirts are clearly legitimate cargo"
+  },
+  "SHIP-006": {
+    "expected_action": "block",
+    "note": "Ivory triggers hard keyword match in restricted_wildlife group"
+  },
+  "SHIP-009": {
+    "expected_action": "block",
+    "note": "AK47 triggers hard keyword match in military_and_dual_use group"
+  },
+  "SHIP-010": {
+    "expected_action": "approve",
+    "note": "Fresh produce is legitimate cargo"
+  }
+}
