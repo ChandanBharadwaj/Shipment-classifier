@@ -1,12 +1,15 @@
-"""Screening pipeline orchestrating Layer 1 → Layer 2 → Layer 3.
+"""Screening pipeline orchestrating Layer 1 → Layer 2 → Layer 3 → Risk Profile.
 
-Enhanced with:
-- Entity resolution / denied-party screening
-- Multi-feature risk scoring
-- Rationale generation
-- Audit trail metadata
+The pipeline produces:
+- Taxonomy matches (Layer 1)
+- AI classification (Layer 2)
+- Entity resolution matches (optional)
+- Legacy single-tier risk assessment (optional)
+- Multi-dimensional RiskProfile — the primary officer-facing output
+- Routing action (advisory — officer decides)
+- Rationale + full audit trail
 
-All enhancement layers are optional and toggleable via settings.
+The officer owns the decision. The system surfaces risk across dimensions.
 """
 
 from __future__ import annotations
@@ -22,6 +25,18 @@ from minerva.entity_resolution.denied_party_list import load_denied_parties
 from minerva.entity_resolution.resolver import EntityResolver, EntityResolverConfig
 from minerva.explain.rationale import TemplatedRationaleGenerator, attach_rationale
 from minerva.logging_utils import get_logger, log_disagreement
+from minerva.risk.dimensions import (
+    DimensionContext,
+    DualUseConfig,
+    GeographyConfig,
+    HsCodeConfig,
+    ValuationConfig,
+)
+from minerva.risk.profile import (
+    ProfileBuilderConfig,
+    RiskProfileBuilder,
+    default_assessors,
+)
 from minerva.risk.scorer import RiskConfig, RiskScorer
 from minerva.router.decision import route_batch
 from minerva.schema import Action, ScreeningDecision, Shipment
@@ -33,15 +48,16 @@ logger = get_logger("pipeline")
 
 
 class ScreeningPipeline:
-    """Orchestrates the full hybrid screening pipeline.
+    """Orchestrates the hybrid screening pipeline + multi-dimensional risk profile.
 
     Layers:
         1. Taxonomy (deterministic, always enabled)
         2. AI Classifier (NLI or DistilBERT, always enabled)
         3. Entity Resolution (optional, via config)
-        4. Risk Scoring (optional, via config)
-        5. Routing (always enabled)
-        6. Rationale Generation (always enabled - audit requirement)
+        4. Legacy Risk Scoring (optional, via config — single tier view)
+        5. Routing (advisory action)
+        6. Risk Profile Builder (always enabled — 8-dimension view)
+        7. Rationale Generation (always enabled - audit requirement)
     """
 
     def __init__(self, settings: MinervaSettings) -> None:
@@ -101,17 +117,58 @@ class ScreeningPipeline:
             else:
                 logger.info("No denied parties configured — entity resolution disabled")
 
-        # Risk scorer (optional)
+        # Legacy single-tier risk scorer (optional)
         self._risk_scorer: RiskScorer | None = None
+        risk_config: RiskConfig | None = None
         if settings.risk_scoring.enabled:
             risk_config = RiskConfig.from_json(settings.risk_config_path)
             self._risk_scorer = RiskScorer(config=risk_config)
-            logger.info("Risk scorer loaded")
+            logger.info("Legacy risk scorer loaded")
+
+        # Multi-dimensional risk profile builder (always enabled)
+        self._profile_builder = self._build_profile_builder(
+            risk_config, settings
+        )
+        logger.info("Risk profile builder ready (8 dimensions)")
 
         # Rationale generator (always on — audit requirement)
         self._rationale_generator = TemplatedRationaleGenerator()
 
         logger.info("Screening pipeline ready")
+
+    @staticmethod
+    def _build_profile_builder(
+        risk_config: RiskConfig | None,
+        settings: MinervaSettings,
+    ) -> RiskProfileBuilder:
+        """Wire up the 8 dimension assessors using shared config sources."""
+        geography_cfg = GeographyConfig(
+            country_tiers=(risk_config.country_tiers if risk_config else {}) or {},
+        )
+        valuation_cfg = ValuationConfig(
+            high_value_threshold=(
+                risk_config.high_value_threshold if risk_config else 100_000.0
+            ),
+        )
+        hs_code_cfg = HsCodeConfig(
+            sensitive_prefixes=(
+                risk_config.sensitive_hs_prefixes if risk_config else []
+            ),
+        )
+        dual_use_cfg = DualUseConfig()
+
+        assessors = default_assessors(
+            geography_config=geography_cfg,
+            valuation_config=valuation_cfg,
+            hs_code_config=hs_code_cfg,
+            dual_use_config=dual_use_cfg,
+        )
+        profile_cfg = ProfileBuilderConfig.from_json(
+            settings.config_dir / "profile_weights.json"
+        )
+        return RiskProfileBuilder(assessors=assessors, config=profile_cfg)
+
+    # ---------------- accessors ----------------
 
     @property
     def matcher(self) -> TaxonomyMatcher:
@@ -129,27 +186,54 @@ class ScreeningPipeline:
     def risk_scorer(self) -> RiskScorer | None:
         return self._risk_scorer
 
+    @property
+    def profile_builder(self) -> RiskProfileBuilder:
+        return self._profile_builder
+
+    # ---------------- public API ----------------
+
     def screen_batch(
         self, shipments: list[Shipment]
     ) -> list[ScreeningDecision]:
-        """Screen a batch of shipments through all enabled layers."""
         if not shipments:
             return []
 
         all_decisions: list[ScreeningDecision] = []
         batch_size = self._settings.batch_size
-
         for start in range(0, len(shipments), batch_size):
             chunk = shipments[start : start + batch_size]
             chunk_decisions = self._screen_chunk(chunk)
             all_decisions.extend(chunk_decisions)
-
         return all_decisions
+
+    def screen(self, shipment: Shipment) -> ScreeningDecision:
+        return self.screen_batch([shipment])[0]
+
+    def build_profile(self, shipment: Shipment):
+        """Build a risk profile for a single shipment without routing.
+
+        Useful when the consumer wants only the dimensional view.
+        """
+        descriptions = [shipment.description]
+        tax_hits = self._matcher.match_batch(descriptions)[0]
+        cls_result = self._classifier.classify_batch(descriptions)[0]
+        entity_matches = (
+            self._entity_resolver.resolve_shipment(shipment)
+            if self._entity_resolver else []
+        )
+        ctx = DimensionContext(
+            shipment=shipment,
+            taxonomy_hits=tax_hits,
+            classification=cls_result,
+            entity_matches=entity_matches,
+        )
+        return self._profile_builder.build(ctx)
+
+    # ---------------- internals ----------------
 
     def _screen_chunk(
         self, shipments: list[Shipment]
     ) -> list[ScreeningDecision]:
-        """Process a single chunk through all enabled layers."""
         descriptions = [s.description for s in shipments]
 
         # Layer 1: Taxonomy
@@ -163,12 +247,12 @@ class ScreeningPipeline:
         if self._entity_resolver is not None:
             entity_results = self._entity_resolver.resolve_batch(shipments)
 
-        # Risk scoring (optional)
+        # Legacy single-tier risk scoring (optional)
         risk_results: list | None = None
         if self._risk_scorer is not None:
             risk_results = self._risk_scorer.score_batch(shipments)
 
-        # Layer 3: Routing
+        # Layer 3: Routing (advisory action)
         decisions = route_batch(
             shipments=shipments,
             taxonomy_results=taxonomy_results,
@@ -178,7 +262,29 @@ class ScreeningPipeline:
             risk_results=risk_results,
         )
 
-        # Attach audit trail metadata
+        # Build multi-dimensional profiles for every shipment
+        contexts = [
+            DimensionContext(
+                shipment=s,
+                taxonomy_hits=t,
+                classification=c,
+                entity_matches=(e if entity_results else []),
+            )
+            for s, t, c, e in zip(
+                shipments,
+                taxonomy_results,
+                classification_results,
+                entity_results if entity_results else [[] for _ in shipments],
+                strict=True,
+            )
+        ]
+        profiles = self._profile_builder.build_batch(contexts)
+
+        # Attach profiles and audit metadata
+        decisions = [
+            d.model_copy(update={"risk_profile": p})
+            for d, p in zip(decisions, profiles, strict=True)
+        ]
         decisions = self._attach_audit_metadata(decisions)
 
         # Generate rationales
@@ -194,7 +300,6 @@ class ScreeningPipeline:
     def _attach_audit_metadata(
         self, decisions: list[ScreeningDecision]
     ) -> list[ScreeningDecision]:
-        """Attach model version, classifier type, and active thresholds to each decision."""
         thresholds = {
             "taxonomy": {
                 "critical": self._settings.taxonomy_thresholds.critical,
@@ -231,16 +336,13 @@ class ScreeningPipeline:
         taxonomy_results: list[list],
         decisions: list[ScreeningDecision],
     ) -> None:
-        """Log disagreements between taxonomy and AI classifier."""
         for shipment, tax_hits, decision in zip(
             shipments, taxonomy_results, decisions, strict=True
         ):
             has_taxonomy_hit = len(tax_hits) > 0
             ai_result = decision.classification
-
             if ai_result is None:
                 continue
-
             if has_taxonomy_hit and ai_result.label.value == "allowed":
                 log_disagreement(
                     logger=logger,
@@ -250,7 +352,6 @@ class ScreeningPipeline:
                     ai_confidence=ai_result.confidence,
                     description=shipment.description,
                 )
-
             if not has_taxonomy_hit and ai_result.label.value == "restricted":
                 if decision.action == Action.APPROVE:
                     log_disagreement(
@@ -261,7 +362,3 @@ class ScreeningPipeline:
                         ai_confidence=ai_result.confidence,
                         description=shipment.description,
                     )
-
-    def screen(self, shipment: Shipment) -> ScreeningDecision:
-        """Screen a single shipment (convenience wrapper)."""
-        return self.screen_batch([shipment])[0]

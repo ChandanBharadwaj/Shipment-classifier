@@ -25,7 +25,7 @@ class ClassifierLabel(str, Enum):
 
 
 class RiskScore(int, Enum):
-    """Risk tier from 1 (low) to 5 (critical)."""
+    """Legacy single-tier risk score (1-5)."""
 
     VERY_LOW = 1
     LOW = 2
@@ -34,18 +34,49 @@ class RiskScore(int, Enum):
     CRITICAL = 5
 
 
-class Shipment(BaseModel):
-    """Shipment to be screened.
+class Severity(str, Enum):
+    """Severity level used throughout the multi-dimensional risk profile."""
 
-    `description` is the required free-text field.
-    All other fields are optional structured signals used by the risk scorer
-    and entity resolution layer.
-    """
+    NONE = "none"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+    @property
+    def rank(self) -> int:
+        return _SEVERITY_RANKS[self]
+
+
+_SEVERITY_RANKS = {
+    Severity.NONE: 0,
+    Severity.LOW: 1,
+    Severity.MEDIUM: 2,
+    Severity.HIGH: 3,
+    Severity.CRITICAL: 4,
+}
+
+
+class RiskDimension(str, Enum):
+    """Distinct aspects of risk surfaced in the risk profile."""
+
+    GOODS = "goods"                        # What's being shipped
+    PARTY = "party"                        # Who is involved
+    GEOGRAPHY = "geography"                # Where it's going / from
+    VALUATION = "valuation"                # Declared value anomalies
+    HS_CODE = "hs_code"                    # Tariff classification risk
+    DATA_QUALITY = "data_quality"          # Completeness & coherence
+    MODEL_UNCERTAINTY = "model_uncertainty"  # How confident the AI is
+    DUAL_USE = "dual_use"                  # End-use / catch-all concerns
+
+
+class Shipment(BaseModel):
+    """Shipment to be screened."""
 
     id: str
     description: str
 
-    # Structured features (optional, used by risk scorer and entity resolution)
+    # Structured features
     origin_country: str | None = None
     destination_country: str | None = None
     consignee: str | None = None
@@ -88,31 +119,29 @@ class ClassificationResult(BaseModel):
 
 
 class EntityMatch(BaseModel):
-    """A denied-party / watchlist match against a shipment party."""
-
-    matched_party: str            # name of the denied party matched
-    input_party: str              # name as appeared on the shipment
-    role: str                     # "consignee" | "shipper"
-    score: float                  # fuzzy match score 0.0 - 1.0
-    list_name: str                # source list identifier
+    matched_party: str
+    input_party: str
+    role: str
+    score: float
+    list_name: str
     exact_match: bool = False
 
     model_config = {"frozen": True}
 
 
 class RiskSignal(BaseModel):
-    """A single risk signal contributing to the overall score."""
+    """Legacy signal type used by the single-tier RiskScorer."""
 
-    name: str                     # e.g. "high_risk_origin_country"
-    weight: float                 # contribution weight
-    value: float                  # signal value (0.0 - 1.0)
-    description: str = ""         # human-readable explanation
+    name: str
+    weight: float
+    value: float
+    description: str = ""
 
     model_config = {"frozen": True}
 
 
 class RiskAssessment(BaseModel):
-    """Multi-feature risk assessment for a shipment."""
+    """Legacy single-tier risk assessment."""
 
     score: RiskScore
     raw_score: float = Field(ge=0.0, le=1.0)
@@ -121,17 +150,96 @@ class RiskAssessment(BaseModel):
     model_config = {"frozen": True}
 
 
+# --- Multi-dimensional risk profile types ---
+
+
+class DimensionSignal(BaseModel):
+    """A single piece of evidence contributing to a dimension assessment."""
+
+    name: str
+    value: float = Field(ge=0.0, le=1.0)
+    weight: float = 1.0
+    evidence: str                   # human-readable evidence
+
+    model_config = {"frozen": True}
+
+
+class DimensionAssessment(BaseModel):
+    """Assessment of one risk dimension for a shipment."""
+
+    dimension: RiskDimension
+    severity: Severity
+    score: float = Field(ge=0.0, le=1.0)
+    signals: list[DimensionSignal] = Field(default_factory=list)
+    summary: str = ""               # one-line summary
+
+    model_config = {"frozen": True}
+
+
+class Flag(BaseModel):
+    """A hard red-flag finding independent of dimension scores.
+
+    Flags surface the officer's attention to specific, non-negotiable evidence
+    (e.g. a taxonomy keyword hit or an exact denied-party match).
+    """
+
+    name: str                       # e.g. "taxonomy_keyword_hit"
+    severity: Severity
+    dimension: RiskDimension
+    description: str
+
+    model_config = {"frozen": True}
+
+
+class RiskProfile(BaseModel):
+    """Multi-dimensional risk profile for a shipment.
+
+    This is the primary output surfaced to compliance officers.
+    The system does not take action — the officer decides. The
+    `advisory_action` is a non-binding suggestion.
+    """
+
+    shipment_id: str
+    overall_severity: Severity
+    overall_score: float = Field(ge=0.0, le=1.0)
+    dimensions: list[DimensionAssessment] = Field(default_factory=list)
+    flags: list[Flag] = Field(default_factory=list)
+    narrative: str = ""
+
+    # Advisory (non-authoritative) - officer owns the decision
+    advisory_action: Action = Action.MANUAL_REVIEW
+    advisory_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    model_config = {"frozen": True}
+
+    def get_dimension(
+        self, dimension: RiskDimension
+    ) -> DimensionAssessment | None:
+        for d in self.dimensions:
+            if d.dimension == dimension:
+                return d
+        return None
+
+
 class ScreeningDecision(BaseModel):
+    """Screening output including routing action and full risk profile.
+
+    NOTE: `action` is produced by the router as an automated decision.
+    In advisory deployments, the `risk_profile.advisory_action` is the
+    officer-facing suggestion and the officer makes the final call.
+    """
+
     shipment_id: str
     action: Action
     taxonomy_hits: list[TaxonomyHit] = Field(default_factory=list)
     classification: ClassificationResult | None = None
     entity_matches: list[EntityMatch] = Field(default_factory=list)
     risk_assessment: RiskAssessment | None = None
+    risk_profile: RiskProfile | None = None
     reason: str = ""
-    rationale: str = ""           # Detailed human-readable explanation for auditors
+    rationale: str = ""
 
-    # Audit trail fields
+    # Audit trail
     model_version: str | None = None
     classifier_type: str | None = None
     thresholds_snapshot: dict[str, Any] = Field(default_factory=dict)

@@ -18,6 +18,23 @@ Six-stage hybrid screening pipeline:
 - **Active Learning Sampler** — selects the *most informative* uncertain items for reviewer labeling (uncertainty + diversity via gATE-style core-set selection), for 5–10× labeling efficiency.
 - **Drift Monitoring** — PSI on confidence distributions, label distributions, and per-taxonomy-group hit rates. Baselines stored for Phase 3 automation safety.
 
+### Multi-Dimensional Risk Profile
+
+The system does not take action — it **surfaces risk across 8 dimensions** and leaves the decision to the compliance officer:
+
+| Dimension | What it surfaces |
+|-----------|-----------------|
+| `goods` | What the item is — taxonomy hits + AI classification verdict |
+| `party` | Who is involved — denied-party fuzzy/exact matches on consignee/shipper |
+| `geography` | Where it's going / from — origin and destination country tiers |
+| `valuation` | Declared value anomalies — high-value, round-number (TBML indicator), non-positive |
+| `hs_code` | Tariff classification — sensitive prefix, missing, malformed |
+| `data_quality` | Completeness & coherence — missing fields, short description, origin=destination |
+| `model_uncertainty` | How confident the AI is — inverse of classifier confidence |
+| `dual_use` | End-use / catch-all — dual-use keyword scan + HS chapter heuristic |
+
+Each dimension produces `severity` (none/low/medium/high/critical), a `score`, and **evidence signals** with human-readable explanations. **Hard flags** (exact denied-party match, taxonomy keyword hit) are surfaced independently of dimension scores. An `advisory_action` is emitted as a non-binding suggestion; the officer owns the final call.
+
 ```
 Shipment Description
         │
@@ -73,7 +90,8 @@ uvicorn minerva.api.app:create_app --factory --host 0.0.0.0 --port 8000
 | `PUT` | `/taxonomy` | Update taxonomy (re-embeds) |
 | `POST` | `/feedback` | Submit reviewer feedback |
 | `GET` | `/feedback/disagreements` | List AI/keyword disagreements |
-| `POST` | `/risk/score` | Compute risk assessment for a shipment |
+| `POST` | `/risk/score` | Compute legacy single-tier risk assessment for a shipment |
+| `POST` | `/risk/profile` | **Multi-dimensional risk profile** across 8 dimensions (primary officer view) |
 | `POST` | `/entity/resolve` | Resolve shipment parties against denied-party list |
 | `POST` | `/monitoring/drift` | Compare baseline vs current distribution (PSI, hit rates) |
 | `POST` | `/active-learning/select` | Select most informative items for reviewer labeling |

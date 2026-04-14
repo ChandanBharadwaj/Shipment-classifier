@@ -3,8 +3,9 @@
 Produces human-readable explanations for each decision — required for
 EU AI Act audit trails (enforcement from August 2026) and WCO guidance.
 
-Default implementation uses templated generation; pluggable for future
-LLM-based rationale if needed.
+When a RiskProfile is attached to the decision, the rationale surfaces
+each dimension's severity, evidence, and contributing signals — helping
+the compliance officer see every aspect of risk at a glance.
 """
 
 from __future__ import annotations
@@ -12,31 +13,31 @@ from __future__ import annotations
 from typing import Protocol
 
 from minerva.schema import (
-    Action,
+    DimensionAssessment,
     EntityMatch,
+    Flag,
     RiskAssessment,
+    RiskProfile,
     ScreeningDecision,
+    Severity,
     Shipment,
 )
 
 
 class RationaleGenerator(Protocol):
-    """Interface for rationale generators."""
-
     def generate(
         self,
         shipment: Shipment,
         decision: ScreeningDecision,
     ) -> str:
-        """Produce a human-readable rationale for a decision."""
         ...
 
 
 class TemplatedRationaleGenerator:
     """Default rationale generator using structured templates.
 
-    Produces deterministic, auditable rationales without external LLM calls.
-    Suitable for initial deployment and regulatory audit trails.
+    Produces deterministic, auditable rationales. If a RiskProfile is
+    present, the rationale leads with the multi-dimensional view.
     """
 
     def generate(
@@ -45,40 +46,109 @@ class TemplatedRationaleGenerator:
         decision: ScreeningDecision,
     ) -> str:
         sections: list[str] = []
+        sections.append(self._header(shipment, decision))
 
-        # 1. Decision summary
-        sections.append(self._summary(shipment, decision))
+        profile = decision.risk_profile
+        if profile is not None:
+            sections.append(self._profile_section(profile))
+        else:
+            # Fall back to legacy rationale when no profile is present
+            if decision.taxonomy_hits:
+                sections.append(self._taxonomy_section(decision))
+            if decision.classification is not None:
+                sections.append(self._classification_section(decision))
+            if decision.entity_matches:
+                sections.append(self._entity_section(decision.entity_matches))
+            if decision.risk_assessment is not None:
+                sections.append(self._risk_section(decision.risk_assessment))
 
-        # 2. Taxonomy evidence
-        if decision.taxonomy_hits:
-            sections.append(self._taxonomy_section(decision))
-
-        # 3. AI classification
-        if decision.classification is not None:
-            sections.append(self._classification_section(decision))
-
-        # 4. Entity resolution
-        if decision.entity_matches:
-            sections.append(self._entity_section(decision.entity_matches))
-
-        # 5. Risk assessment
-        if decision.risk_assessment is not None:
-            sections.append(self._risk_section(decision.risk_assessment))
-
-        # 6. Final reason
-        sections.append(f"Final action: {decision.action.value.upper()}.")
-
+        sections.append(
+            f"Advisory action (officer-owned decision): "
+            f"{decision.action.value.upper()}. Reason: {decision.reason}"
+        )
         return " ".join(sections)
 
+    # ---------------- header ----------------
+
     @staticmethod
-    def _summary(shipment: Shipment, decision: ScreeningDecision) -> str:
-        desc_preview = shipment.description[:120]
-        if len(shipment.description) > 120:
-            desc_preview += "..."
+    def _header(shipment: Shipment, decision: ScreeningDecision) -> str:
+        desc = shipment.description
+        preview = desc[:120] + "..." if len(desc) > 120 else desc
         return (
-            f"Shipment {shipment.id} (\"{desc_preview}\") was screened through "
-            f"the hybrid pipeline."
+            f"Shipment {shipment.id} (\"{preview}\") was screened through the "
+            f"Minerva hybrid pipeline."
         )
+
+    # ---------------- profile-driven narrative ----------------
+
+    @staticmethod
+    def _profile_section(profile: RiskProfile) -> str:
+        parts: list[str] = []
+        parts.append(
+            f"OVERALL RISK: {profile.overall_severity.value.upper()} "
+            f"(score {profile.overall_score:.3f})."
+        )
+
+        if profile.flags:
+            parts.append(
+                f"{len(profile.flags)} hard flag(s): "
+                + "; ".join(
+                    f"[{f.severity.value.upper()}] {f.description}"
+                    for f in profile.flags
+                )
+                + "."
+            )
+
+        # Elevated dimensions first
+        elevated = [
+            d for d in profile.dimensions
+            if d.severity.rank >= Severity.MEDIUM.rank
+        ]
+        if elevated:
+            parts.append("Elevated dimensions:")
+            for d in elevated:
+                parts.append(
+                    f"[{d.dimension.value} / {d.severity.value}] {d.summary}"
+                )
+                if d.signals:
+                    parts.append(
+                        "Evidence: "
+                        + "; ".join(s.evidence for s in d.signals)
+                        + "."
+                    )
+
+        # Low-severity dimensions summarized
+        quiet = [
+            d for d in profile.dimensions
+            if d.severity.rank < Severity.MEDIUM.rank and d.signals
+        ]
+        if quiet:
+            parts.append(
+                "Low-severity dimensions with signals: "
+                + ", ".join(d.dimension.value for d in quiet)
+                + "."
+            )
+
+        clean = [
+            d for d in profile.dimensions
+            if d.severity.rank == 0 and not d.signals
+        ]
+        if clean:
+            parts.append(
+                "No concerns in: "
+                + ", ".join(d.dimension.value for d in clean)
+                + "."
+            )
+
+        parts.append(
+            f"System's advisory suggestion: "
+            f"{profile.advisory_action.value.upper()} "
+            f"(confidence {profile.advisory_confidence:.2f}). "
+            f"Compliance officer makes the final call."
+        )
+        return " ".join(parts)
+
+    # ---------------- legacy sections (when no profile) ----------------
 
     @staticmethod
     def _taxonomy_section(decision: ScreeningDecision) -> str:
@@ -140,10 +210,7 @@ def attach_rationale(
     shipments: list[Shipment],
     decisions: list[ScreeningDecision],
 ) -> list[ScreeningDecision]:
-    """Produce a new decision list with rationales attached.
-
-    Returns new ScreeningDecision instances since the model is frozen.
-    """
+    """Produce a new decision list with rationales attached."""
     updated: list[ScreeningDecision] = []
     for shipment, decision in zip(shipments, decisions, strict=True):
         rationale = generator.generate(shipment, decision)

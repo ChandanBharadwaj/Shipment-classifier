@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from minerva.schema import Action, ClassifierLabel, RiskLevel
+from minerva.schema import Action, ClassifierLabel, RiskDimension, RiskLevel, Severity
 
 
 # --- Request models ---
@@ -88,6 +88,44 @@ class RiskAssessmentResponse(BaseModel):
     signals: list[RiskSignalResponse] = Field(default_factory=list)
 
 
+class DimensionSignalResponse(BaseModel):
+    name: str
+    value: float
+    weight: float
+    evidence: str
+
+
+class DimensionAssessmentResponse(BaseModel):
+    dimension: RiskDimension
+    severity: Severity
+    score: float
+    signals: list[DimensionSignalResponse] = Field(default_factory=list)
+    summary: str = ""
+
+
+class FlagResponse(BaseModel):
+    name: str
+    severity: Severity
+    dimension: RiskDimension
+    description: str
+
+
+class RiskProfileResponse(BaseModel):
+    """Multi-dimensional risk profile — the primary officer-facing output.
+
+    The officer owns the decision; `advisory_action` is a non-binding suggestion.
+    """
+
+    shipment_id: str
+    overall_severity: Severity
+    overall_score: float
+    dimensions: list[DimensionAssessmentResponse] = Field(default_factory=list)
+    flags: list[FlagResponse] = Field(default_factory=list)
+    narrative: str = ""
+    advisory_action: Action
+    advisory_confidence: float
+
+
 class ScreeningDecisionResponse(BaseModel):
     shipment_id: str
     action: Action
@@ -95,6 +133,7 @@ class ScreeningDecisionResponse(BaseModel):
     classification: ClassificationResponse | None = None
     entity_matches: list[EntityMatchResponse] = Field(default_factory=list)
     risk_assessment: RiskAssessmentResponse | None = None
+    risk_profile: RiskProfileResponse | None = None
     reason: str = ""
     rationale: str = ""
     model_version: str | None = None
