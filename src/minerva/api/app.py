@@ -7,7 +7,16 @@ from fastapi import FastAPI
 
 from minerva import __version__
 from minerva.api.dependencies import set_feedback_store, set_pipeline
-from minerva.api.routes import feedback, health, screening, taxonomy
+from minerva.api.routes import (
+    active_learning,
+    entity,
+    feedback,
+    health,
+    monitoring,
+    risk,
+    screening,
+    taxonomy,
+)
 from minerva.config import MinervaSettings
 from minerva.feedback.store import FeedbackStore
 from minerva.logging_utils import get_logger, setup_logging
@@ -59,5 +68,11 @@ def create_app() -> FastAPI:
     app.include_router(screening.router, prefix="/screen", tags=["screening"])
     app.include_router(taxonomy.router, prefix="/taxonomy", tags=["taxonomy"])
     app.include_router(feedback.router, prefix="/feedback", tags=["feedback"])
+    app.include_router(risk.router, prefix="/risk", tags=["risk"])
+    app.include_router(entity.router, prefix="/entity", tags=["entity"])
+    app.include_router(monitoring.router, prefix="/monitoring", tags=["monitoring"])
+    app.include_router(
+        active_learning.router, prefix="/active-learning", tags=["active-learning"]
+    )
 
     return app

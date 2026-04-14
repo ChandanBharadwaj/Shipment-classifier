@@ -4,11 +4,19 @@ Trade compliance shipment screening system combining deterministic taxonomy enfo
 
 ## Architecture
 
-Three-layer hybrid screening pipeline:
+Six-stage hybrid screening pipeline:
 
 1. **Layer 1 — Hard Taxonomy**: Deterministic enforcement via semantic similarity matching against configurable taxonomy groups. Taxonomy hits are non-negotiable — always blocked.
 2. **Layer 2 — AI Classifier**: Zero-shot NLI (Phase 1) or fine-tuned DistilBERT (Phase 2+) producing 3-class output: Allowed / Restricted / Needs Review.
-3. **Layer 3 — Confidence Router**: Routes decisions based on confidence thresholds — high-confidence results are automated, uncertain results go to manual review.
+3. **Entity Resolution**: Cascade fuzzy-matches shipment consignee/shipper against a denied-party list (exact → auto-block, fuzzy → review).
+4. **Multi-Feature Risk Scoring**: Combines origin/destination country tiers, declared value, HS code, and data quality into a 1–5 risk tier.
+5. **Layer 3 — Confidence + Risk Router**: Routes decisions based on confidence thresholds and risk tier. Critical risk escalates to review even on high-confidence allowed.
+6. **Rationale Generation + Audit Trail**: Every decision produces a human-readable rationale and a full audit record (model version, thresholds snapshot, input snapshot) — required for EU AI Act enforcement from August 2026.
+
+### Supporting subsystems
+
+- **Active Learning Sampler** — selects the *most informative* uncertain items for reviewer labeling (uncertainty + diversity via gATE-style core-set selection), for 5–10× labeling efficiency.
+- **Drift Monitoring** — PSI on confidence distributions, label distributions, and per-taxonomy-group hit rates. Baselines stored for Phase 3 automation safety.
 
 ```
 Shipment Description
@@ -65,6 +73,10 @@ uvicorn minerva.api.app:create_app --factory --host 0.0.0.0 --port 8000
 | `PUT` | `/taxonomy` | Update taxonomy (re-embeds) |
 | `POST` | `/feedback` | Submit reviewer feedback |
 | `GET` | `/feedback/disagreements` | List AI/keyword disagreements |
+| `POST` | `/risk/score` | Compute risk assessment for a shipment |
+| `POST` | `/entity/resolve` | Resolve shipment parties against denied-party list |
+| `POST` | `/monitoring/drift` | Compare baseline vs current distribution (PSI, hit rates) |
+| `POST` | `/active-learning/select` | Select most informative items for reviewer labeling |
 
 ### Single Shipment Screening
 

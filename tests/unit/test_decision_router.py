@@ -12,7 +12,11 @@ from minerva.schema import (
     Action,
     ClassificationResult,
     ClassifierLabel,
+    EntityMatch,
+    RiskAssessment,
     RiskLevel,
+    RiskScore,
+    RiskSignal,
     Shipment,
     TaxonomyHit,
 )
@@ -274,6 +278,132 @@ class TestRouteBatch:
                 [_make_classification(ClassifierLabel.ALLOWED, 0.95)],
                 routing_config,
             )
+
+
+class TestEntityResolutionRouting:
+    def test_entity_auto_block_takes_precedence_over_ai(self, shipment, routing_config):
+        entity = EntityMatch(
+            matched_party="Blocked Industries",
+            input_party="blocked industries ltd",
+            role="consignee",
+            score=0.95,
+            list_name="ofac",
+            exact_match=False,
+        )
+        decision = route(
+            shipment,
+            taxonomy_hits=[],
+            classification=_make_classification(ClassifierLabel.ALLOWED, 0.99),
+            routing_config=routing_config,
+            entity_matches=[entity],
+        )
+        assert decision.action == Action.BLOCK
+        assert "Denied party" in decision.reason
+
+    def test_exact_entity_match_blocks(self, shipment, routing_config):
+        entity = EntityMatch(
+            matched_party="X", input_party="x", role="consignee",
+            score=1.0, list_name="t", exact_match=True,
+        )
+        decision = route(
+            shipment,
+            taxonomy_hits=[],
+            classification=_make_classification(ClassifierLabel.ALLOWED, 0.99),
+            routing_config=routing_config,
+            entity_matches=[entity],
+        )
+        assert decision.action == Action.BLOCK
+
+    def test_moderate_entity_match_manual_review(self, shipment, routing_config):
+        entity = EntityMatch(
+            matched_party="X", input_party="x", role="consignee",
+            score=0.85, list_name="t", exact_match=False,
+        )
+        decision = route(
+            shipment,
+            taxonomy_hits=[],
+            classification=_make_classification(ClassifierLabel.ALLOWED, 0.99),
+            routing_config=routing_config,
+            entity_matches=[entity],
+        )
+        assert decision.action == Action.MANUAL_REVIEW
+        assert "denied-party" in decision.reason.lower()
+
+    def test_taxonomy_still_trumps_entity(self, shipment, routing_config):
+        # Taxonomy hit takes absolute precedence
+        entity = EntityMatch(
+            matched_party="X", input_party="x", role="consignee",
+            score=0.95, list_name="t", exact_match=False,
+        )
+        decision = route(
+            shipment,
+            taxonomy_hits=[_make_taxonomy_hit(keyword="ak47")],
+            classification=_make_classification(ClassifierLabel.ALLOWED, 0.99),
+            routing_config=routing_config,
+            entity_matches=[entity],
+        )
+        assert decision.action == Action.BLOCK
+        assert "Taxonomy" in decision.reason
+
+
+class TestRiskBasedRouting:
+    def test_critical_risk_forces_review(self, shipment, routing_config):
+        risk = RiskAssessment(
+            score=RiskScore.CRITICAL,
+            raw_score=0.85,
+            signals=[RiskSignal(name="origin", weight=0.25, value=1.0)],
+        )
+        decision = route(
+            shipment,
+            taxonomy_hits=[],
+            classification=_make_classification(ClassifierLabel.ALLOWED, 0.99),
+            routing_config=routing_config,
+            risk_assessment=risk,
+        )
+        assert decision.action == Action.MANUAL_REVIEW
+        assert "Critical risk" in decision.reason
+
+    def test_high_risk_with_allowed_ai_escalates(self, shipment, routing_config):
+        risk = RiskAssessment(
+            score=RiskScore.HIGH,
+            raw_score=0.65,
+            signals=[],
+        )
+        decision = route(
+            shipment,
+            taxonomy_hits=[],
+            classification=_make_classification(ClassifierLabel.ALLOWED, 0.95),
+            routing_config=routing_config,
+            risk_assessment=risk,
+        )
+        assert decision.action == Action.MANUAL_REVIEW
+
+    def test_low_risk_allows_auto_approve(self, shipment, routing_config):
+        risk = RiskAssessment(
+            score=RiskScore.LOW,
+            raw_score=0.20,
+            signals=[],
+        )
+        decision = route(
+            shipment,
+            taxonomy_hits=[],
+            classification=_make_classification(ClassifierLabel.ALLOWED, 0.95),
+            routing_config=routing_config,
+            risk_assessment=risk,
+        )
+        assert decision.action == Action.APPROVE
+
+    def test_critical_risk_still_blocks_if_taxonomy(self, shipment, routing_config):
+        risk = RiskAssessment(score=RiskScore.CRITICAL, raw_score=0.85)
+        decision = route(
+            shipment,
+            taxonomy_hits=[_make_taxonomy_hit(keyword="ak47")],
+            classification=_make_classification(ClassifierLabel.ALLOWED, 0.99),
+            routing_config=routing_config,
+            risk_assessment=risk,
+        )
+        # Taxonomy always wins
+        assert decision.action == Action.BLOCK
 
 
 class TestCustomThresholds:

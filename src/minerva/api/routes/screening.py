@@ -18,6 +18,22 @@ from minerva.schema import Shipment
 router = APIRouter()
 
 
+def _to_shipment(request: ScreenRequest) -> Shipment:
+    return Shipment(
+        id=request.id,
+        description=request.description,
+        origin_country=request.origin_country,
+        destination_country=request.destination_country,
+        consignee=request.consignee,
+        shipper=request.shipper,
+        declared_value=request.declared_value,
+        declared_currency=request.declared_currency,
+        hs_code=request.hs_code,
+        weight_kg=request.weight_kg,
+        metadata=request.metadata,
+    )
+
+
 @router.post("", response_model=ScreeningDecisionResponse)
 def screen_shipment(
     request: ScreenRequest,
@@ -25,11 +41,7 @@ def screen_shipment(
     store: FeedbackStore | None = Depends(get_feedback_store),
 ) -> ScreeningDecisionResponse:
     """Screen a single shipment."""
-    shipment = Shipment(
-        id=request.id,
-        description=request.description,
-        metadata=request.metadata,
-    )
+    shipment = _to_shipment(request)
     decision = pipeline.screen(shipment)
 
     if store:
@@ -45,14 +57,7 @@ def screen_batch(
     store: FeedbackStore | None = Depends(get_feedback_store),
 ) -> BatchScreenResponse:
     """Screen a batch of shipments."""
-    shipments = [
-        Shipment(
-            id=s.id,
-            description=s.description,
-            metadata=s.metadata,
-        )
-        for s in request.shipments
-    ]
+    shipments = [_to_shipment(s) for s in request.shipments]
     decisions = pipeline.screen_batch(shipments)
 
     if store:

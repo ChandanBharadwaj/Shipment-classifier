@@ -13,6 +13,25 @@ CREATE TABLE IF NOT EXISTS screening_feedback (
     reviewer_id       VARCHAR(100),
     reviewer_notes    TEXT,
     disagreement_type VARCHAR(50),
+
+    -- Risk scoring
+    risk_score        INTEGER,
+    risk_raw          NUMERIC(5,4),
+
+    -- Entity resolution
+    entity_hit        BOOLEAN DEFAULT FALSE,
+    entity_list_name  VARCHAR(100),
+    entity_match_score NUMERIC(4,3),
+
+    -- Rationale
+    rationale         TEXT,
+
+    -- Audit trail (required for EU AI Act enforcement from Aug 2026)
+    model_version     VARCHAR(100),
+    classifier_type   VARCHAR(50),
+    thresholds_snapshot JSONB,
+    input_snapshot    JSONB,
+
     created_at        TIMESTAMPTZ DEFAULT NOW(),
     reviewed_at       TIMESTAMPTZ
 );
@@ -32,3 +51,24 @@ CREATE INDEX IF NOT EXISTS idx_screening_feedback_created
 CREATE INDEX IF NOT EXISTS idx_screening_feedback_reviewer
     ON screening_feedback(reviewer_id)
     WHERE reviewer_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_screening_feedback_risk
+    ON screening_feedback(risk_score)
+    WHERE risk_score IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_screening_feedback_entity_hit
+    ON screening_feedback(entity_hit)
+    WHERE entity_hit = TRUE;
+
+
+-- Drift baseline snapshots for monitoring (Phase 3 automation prerequisite)
+CREATE TABLE IF NOT EXISTS drift_baselines (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name            VARCHAR(100) NOT NULL UNIQUE,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    sample_size     INTEGER NOT NULL,
+    confidences     JSONB NOT NULL,
+    labels          JSONB NOT NULL,
+    hit_rates       JSONB NOT NULL,
+    centroid        JSONB
+);

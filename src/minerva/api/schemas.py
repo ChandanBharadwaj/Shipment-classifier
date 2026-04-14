@@ -13,6 +13,14 @@ from minerva.schema import Action, ClassifierLabel, RiskLevel
 class ScreenRequest(BaseModel):
     id: str
     description: str
+    origin_country: str | None = None
+    destination_country: str | None = None
+    consignee: str | None = None
+    shipper: str | None = None
+    declared_value: float | None = None
+    declared_currency: str | None = None
+    hs_code: str | None = None
+    weight_kg: float | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -58,12 +66,40 @@ class ClassificationResponse(BaseModel):
     confidence: float
 
 
+class EntityMatchResponse(BaseModel):
+    matched_party: str
+    input_party: str
+    role: str
+    score: float
+    list_name: str
+    exact_match: bool
+
+
+class RiskSignalResponse(BaseModel):
+    name: str
+    weight: float
+    value: float
+    description: str
+
+
+class RiskAssessmentResponse(BaseModel):
+    score: int
+    raw_score: float
+    signals: list[RiskSignalResponse] = Field(default_factory=list)
+
+
 class ScreeningDecisionResponse(BaseModel):
     shipment_id: str
     action: Action
     taxonomy_hits: list[TaxonomyHitResponse] = Field(default_factory=list)
     classification: ClassificationResponse | None = None
+    entity_matches: list[EntityMatchResponse] = Field(default_factory=list)
+    risk_assessment: RiskAssessmentResponse | None = None
     reason: str = ""
+    rationale: str = ""
+    model_version: str | None = None
+    classifier_type: str | None = None
+    thresholds_snapshot: dict[str, Any] = Field(default_factory=dict)
 
 
 class BatchScreenResponse(BaseModel):

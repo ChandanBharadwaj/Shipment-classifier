@@ -18,6 +18,22 @@ class RoutingConfig(BaseSettings):
     auto_block_min_confidence: float = 0.90
 
 
+class EntityResolutionConfig(BaseSettings):
+    enabled: bool = True
+    auto_block_threshold: float = 0.92
+    review_threshold: float = 0.80
+
+
+class RiskScoringConfig(BaseSettings):
+    enabled: bool = True
+
+
+class DriftMonitoringConfig(BaseSettings):
+    enabled: bool = True
+    psi_warning: float = 0.10
+    psi_alert: float = 0.25
+
+
 class NLIHypotheses(BaseSettings):
     allowed: str = "This shipment is allowed for export without restrictions."
     restricted: str = "This shipment contains restricted or controlled items."
@@ -42,11 +58,26 @@ class MinervaSettings(BaseSettings):
         default_factory=TaxonomySimilarityThresholds
     )
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
+    entity_resolution: EntityResolutionConfig = Field(
+        default_factory=EntityResolutionConfig
+    )
+    risk_scoring: RiskScoringConfig = Field(default_factory=RiskScoringConfig)
+    drift_monitoring: DriftMonitoringConfig = Field(
+        default_factory=DriftMonitoringConfig
+    )
     nli_hypotheses: NLIHypotheses = Field(default_factory=NLIHypotheses)
 
     @property
     def taxonomy_path(self) -> Path:
         return self.config_dir / "taxonomy.json"
+
+    @property
+    def denied_parties_path(self) -> Path:
+        return self.config_dir / "denied_parties.json"
+
+    @property
+    def risk_config_path(self) -> Path:
+        return self.config_dir / "risk_config.json"
 
     def get_similarity_threshold(self, risk_level: str) -> float:
         return getattr(self.taxonomy_thresholds, risk_level.lower())
