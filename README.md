@@ -26,12 +26,17 @@ The system does not take action — it **surfaces risk across 8 dimensions** and
 |-----------|-----------------|
 | `goods` | What the item is — taxonomy hits + AI classification verdict |
 | `party` | Who is involved — denied-party fuzzy/exact matches on consignee/shipper |
-| `geography` | Where it's going / from — origin and destination country tiers |
+| `geography` | Where it's going / from — country risk intel (LexisNexis), sanctions, FATF status |
 | `valuation` | Declared value anomalies — high-value, round-number (TBML indicator), non-positive |
 | `hs_code` | Tariff classification — sensitive prefix, missing, malformed |
 | `data_quality` | Completeness & coherence — missing fields, short description, origin=destination |
 | `model_uncertainty` | How confident the AI is — inverse of classifier confidence |
 | `dual_use` | End-use / catch-all — dual-use keyword scan + HS chapter heuristic |
+| `cross_border` | Routing / transit / diversion — sanctioned transit, transshipment hubs, FATF-listed jurisdictions, country-of-manufacture mismatch, final-destination mismatch, destination adjacent to sanctioned country, multi-leg opacity |
+
+### Country risk data (LexisNexis, etc.)
+
+Drop your LexisNexis WorldCompliance / CLEAR export into `config/country_risk.json` (Minerva native) or `config/country_risk.csv` (column names configurable). The database is shared by the `geography` and `cross_border` dimensions. Fields captured per country include overall risk tier/score, sanctions status (comprehensive/sectoral), FATF status (grey/black), transshipment-hub flag, and sanctioned-neighbor list (for diversion-risk detection).
 
 Each dimension produces `severity` (none/low/medium/high/critical), a `score`, and **evidence signals** with human-readable explanations. **Hard flags** (exact denied-party match, taxonomy keyword hit) are surfaced independently of dimension scores. An `advisory_action` is emitted as a non-binding suggestion; the officer owns the final call.
 

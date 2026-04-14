@@ -79,5 +79,13 @@ class MinervaSettings(BaseSettings):
     def risk_config_path(self) -> Path:
         return self.config_dir / "risk_config.json"
 
+    @property
+    def country_risk_path(self) -> Path:
+        """Country risk intelligence (LexisNexis-style). JSON or CSV."""
+        json_path = self.config_dir / "country_risk.json"
+        csv_path = self.config_dir / "country_risk.csv"
+        # Prefer CSV if the user has dropped a vendor export there
+        return csv_path if csv_path.exists() else json_path
+
     def get_similarity_threshold(self, risk_level: str) -> float:
         return getattr(self.taxonomy_thresholds, risk_level.lower())

@@ -25,7 +25,9 @@ from minerva.entity_resolution.denied_party_list import load_denied_parties
 from minerva.entity_resolution.resolver import EntityResolver, EntityResolverConfig
 from minerva.explain.rationale import TemplatedRationaleGenerator, attach_rationale
 from minerva.logging_utils import get_logger, log_disagreement
+from minerva.risk.country_risk import CountryRiskDatabase, load_country_risk
 from minerva.risk.dimensions import (
+    CrossBorderConfig,
     DimensionContext,
     DualUseConfig,
     GeographyConfig,
@@ -125,11 +127,27 @@ class ScreeningPipeline:
             self._risk_scorer = RiskScorer(config=risk_config)
             logger.info("Legacy risk scorer loaded")
 
+        # Country risk database (LexisNexis or equivalent, optional)
+        self._country_db = load_country_risk(settings.country_risk_path)
+        if self._country_db.size > 0:
+            logger.info(
+                "Country risk database loaded: %d countries from %s",
+                self._country_db.size,
+                settings.country_risk_path,
+            )
+        else:
+            logger.info(
+                "No country risk database found at %s — GeographyAssessor "
+                "will fall back to tier map; CrossBorderAssessor will run "
+                "with limited signals",
+                settings.country_risk_path,
+            )
+
         # Multi-dimensional risk profile builder (always enabled)
         self._profile_builder = self._build_profile_builder(
-            risk_config, settings
+            risk_config, settings, self._country_db
         )
-        logger.info("Risk profile builder ready (8 dimensions)")
+        logger.info("Risk profile builder ready (9 dimensions)")
 
         # Rationale generator (always on — audit requirement)
         self._rationale_generator = TemplatedRationaleGenerator()
@@ -140,8 +158,9 @@ class ScreeningPipeline:
     def _build_profile_builder(
         risk_config: RiskConfig | None,
         settings: MinervaSettings,
+        country_db: CountryRiskDatabase | None,
     ) -> RiskProfileBuilder:
-        """Wire up the 8 dimension assessors using shared config sources."""
+        """Wire up the 9 dimension assessors using shared config sources."""
         geography_cfg = GeographyConfig(
             country_tiers=(risk_config.country_tiers if risk_config else {}) or {},
         )
@@ -156,12 +175,15 @@ class ScreeningPipeline:
             ),
         )
         dual_use_cfg = DualUseConfig()
+        cross_border_cfg = CrossBorderConfig()
 
         assessors = default_assessors(
             geography_config=geography_cfg,
             valuation_config=valuation_cfg,
             hs_code_config=hs_code_cfg,
             dual_use_config=dual_use_cfg,
+            cross_border_config=cross_border_cfg,
+            country_db=country_db,
         )
         profile_cfg = ProfileBuilderConfig.from_json(
             settings.config_dir / "profile_weights.json"

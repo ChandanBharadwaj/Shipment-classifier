@@ -68,6 +68,7 @@ class RiskDimension(str, Enum):
     DATA_QUALITY = "data_quality"          # Completeness & coherence
     MODEL_UNCERTAINTY = "model_uncertainty"  # How confident the AI is
     DUAL_USE = "dual_use"                  # End-use / catch-all concerns
+    CROSS_BORDER = "cross_border"          # Routing, transit, transshipment, diversion
 
 
 class Shipment(BaseModel):
@@ -85,6 +86,12 @@ class Shipment(BaseModel):
     declared_currency: str | None = None
     hs_code: str | None = None
     weight_kg: float | None = None
+
+    # Routing / cross-border fields
+    transit_countries: list[str] = Field(default_factory=list)
+    country_of_manufacture: str | None = None
+    final_destination: str | None = None
+    incoterms: str | None = None
 
     metadata: dict[str, Any] = Field(default_factory=dict)
 

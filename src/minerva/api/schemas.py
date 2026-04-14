@@ -21,6 +21,11 @@ class ScreenRequest(BaseModel):
     declared_currency: str | None = None
     hs_code: str | None = None
     weight_kg: float | None = None
+    # Cross-border / routing fields
+    transit_countries: list[str] = Field(default_factory=list)
+    country_of_manufacture: str | None = None
+    final_destination: str | None = None
+    incoterms: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

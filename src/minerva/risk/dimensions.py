@@ -1,4 +1,4 @@
-"""Eight risk-dimension assessors.
+"""Nine risk-dimension assessors.
 
 Each assessor examines one aspect of shipment risk and produces a
 DimensionAssessment with severity, score, and human-readable signals.
@@ -8,12 +8,13 @@ does not take action — it surfaces evidence.
 Dimensions:
     GOODS             — what the item is (taxonomy + classifier)
     PARTY             — who is involved (entity resolution)
-    GEOGRAPHY         — where it's going / from (country tiers)
+    GEOGRAPHY         — where it's going / from (country risk intel)
     VALUATION         — declared value anomalies
     HS_CODE           — tariff classification risk
     DATA_QUALITY      — completeness & coherence of shipment metadata
     MODEL_UNCERTAINTY — how confident the AI classifier is
     DUAL_USE          — end-use / catch-all concerns (dual-use keywords)
+    CROSS_BORDER      — routing, transit, transshipment, diversion
 """
 
 from __future__ import annotations
@@ -22,6 +23,11 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
+from minerva.risk.country_risk import (
+    CountryRiskDatabase,
+    CountryRiskLevel,
+    FatfStatus,
+)
 from minerva.schema import (
     ClassificationResult,
     ClassifierLabel,
@@ -265,41 +271,64 @@ class PartyAssessor(BaseAssessor):
 
 @dataclass
 class GeographyConfig:
-    """Country tier map (1 = low risk, 4 = very high risk) and weights."""
+    """Fallback country tier map and per-role weights.
+
+    If a CountryRiskDatabase is supplied to the assessor, it is the
+    primary source of truth. The `country_tiers` map is used as a
+    fallback for countries not present in the risk database.
+    """
     country_tiers: dict[str, int] = field(default_factory=dict)
     origin_weight: float = 1.0
     destination_weight: float = 1.0
 
 
+_COUNTRY_RISK_VALUE = {
+    CountryRiskLevel.UNKNOWN: 0.0,
+    CountryRiskLevel.LOW: 0.25,
+    CountryRiskLevel.MEDIUM: 0.50,
+    CountryRiskLevel.HIGH: 0.80,
+    CountryRiskLevel.CRITICAL: 1.00,
+}
+
+
 class GeographyAssessor(BaseAssessor):
+    """Geography risk — uses LexisNexis-style country risk data when available,
+    falls back to a simple tier map otherwise."""
+
     dimension = RiskDimension.GEOGRAPHY
 
-    def __init__(self, config: GeographyConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: GeographyConfig | None = None,
+        country_db: CountryRiskDatabase | None = None,
+    ) -> None:
         self._config = config or GeographyConfig()
+        self._db = country_db
 
     def assess(self, ctx: DimensionContext) -> DimensionAssessment:
         signals: list[DimensionSignal] = []
         ship = ctx.shipment
 
-        signals.extend(self._country_signal(ship.origin_country, "origin", self._config.origin_weight))
-        signals.extend(self._country_signal(ship.destination_country, "destination", self._config.destination_weight))
+        signals.extend(
+            self._country_signals(ship.origin_country, "origin", self._config.origin_weight)
+        )
+        signals.extend(
+            self._country_signals(
+                ship.destination_country, "destination", self._config.destination_weight
+            )
+        )
 
-        # Data completeness for geography
         if ship.origin_country is None:
             signals.append(
                 DimensionSignal(
-                    name="missing_origin",
-                    value=0.3,
-                    weight=0.3,
+                    name="missing_origin", value=0.3, weight=0.3,
                     evidence="Origin country not provided",
                 )
             )
         if ship.destination_country is None:
             signals.append(
                 DimensionSignal(
-                    name="missing_destination",
-                    value=0.3,
-                    weight=0.3,
+                    name="missing_destination", value=0.3, weight=0.3,
                     evidence="Destination country not provided",
                 )
             )
@@ -315,15 +344,23 @@ class GeographyAssessor(BaseAssessor):
             summary=summary,
         )
 
-    def _country_signal(
+    def _country_signals(
         self, country: str | None, role: str, weight: float
     ) -> list[DimensionSignal]:
         if country is None:
             return []
-        tier = self._config.country_tiers.get(country.upper(), 0)
+        code = country.upper()
+
+        # Prefer country risk database if available and has this country
+        if self._db is not None:
+            entry = self._db.get(code)
+            if entry is not None:
+                return list(self._db_signals(entry, role, weight))
+
+        # Fallback: static tier map
+        tier = self._config.country_tiers.get(code, 0)
         if tier == 0:
             return []
-        # Tier 1..4 maps to 0.25, 0.50, 0.75, 1.0
         value = min(tier / 4.0, 1.0)
         return [
             DimensionSignal(
@@ -331,11 +368,55 @@ class GeographyAssessor(BaseAssessor):
                 value=value,
                 weight=weight,
                 evidence=(
-                    f"{role.capitalize()} country {country.upper()} is "
-                    f"configured as tier {tier} (of 4)"
+                    f"{role.capitalize()} country {code} is configured as "
+                    f"tier {tier} (of 4)"
                 ),
             )
         ]
+
+    def _db_signals(self, entry, role: str, weight: float):
+        """Yield multiple signals derived from a country risk entry."""
+        code = entry.country_code
+        country_name = entry.country_name or code
+
+        # Primary overall risk signal
+        value = max(
+            _COUNTRY_RISK_VALUE[entry.overall_risk],
+            entry.overall_score,
+        )
+        if value > 0:
+            yield DimensionSignal(
+                name=f"{role}_country_risk",
+                value=value,
+                weight=weight,
+                evidence=(
+                    f"{role.capitalize()} country {country_name} "
+                    f"({code}) has {entry.overall_risk.value} overall risk "
+                    f"(score {entry.overall_score:.2f}, source {entry.source})"
+                ),
+            )
+
+        if entry.is_sanctioned:
+            yield DimensionSignal(
+                name=f"{role}_country_sanctioned",
+                value=1.0,
+                weight=weight * 2.0,
+                evidence=(
+                    f"{role.capitalize()} country {country_name} ({code}) "
+                    f"carries {entry.sanctions_status.value} sanctions"
+                ),
+            )
+
+        if entry.is_fatf_listed:
+            yield DimensionSignal(
+                name=f"{role}_fatf_{entry.fatf_status.value}",
+                value=0.8 if entry.fatf_status == FatfStatus.BLACK else 0.6,
+                weight=weight,
+                evidence=(
+                    f"{role.capitalize()} country {country_name} ({code}) "
+                    f"is on the FATF {entry.fatf_status.value} list"
+                ),
+            )
 
     @staticmethod
     def _summary(signals, severity, ship) -> str:
@@ -800,3 +881,271 @@ class DualUseAssessor(BaseAssessor):
             signals=signals,
             summary=summary,
         )
+
+
+# --- 9. CROSS-BORDER / ROUTING ------------------------------------------
+
+@dataclass
+class CrossBorderConfig:
+    """Tunable thresholds and heuristics for cross-border routing risk."""
+
+    # Multi-leg opacity: transit stops above this threshold raise a signal
+    many_transit_threshold: int = 2
+    # Weight applied to each discovered routing signal
+    sanctioned_transit_weight: float = 2.5
+    fatf_transit_weight: float = 1.5
+    transshipment_hub_weight: float = 0.8
+    manufacture_origin_mismatch_weight: float = 1.0
+    diversion_neighbor_weight: float = 1.8
+    final_destination_mismatch_weight: float = 1.0
+    many_transit_weight: float = 0.6
+
+
+class CrossBorderAssessor(BaseAssessor):
+    """Surface routing, transit, transshipment, and diversion risk.
+
+    Uses a CountryRiskDatabase (e.g. loaded from LexisNexis) to evaluate
+    every country on the shipment's route: origin, transit stops,
+    destination, final destination, and country of manufacture.
+
+    Signals surfaced:
+        - Any sanctioned country in the route
+        - Transit through FATF-listed jurisdictions
+        - Route through known transshipment hubs (HK, SG, AE, PA, ...)
+        - Country of manufacture != country of origin (re-export signal)
+        - Final destination != immediate destination (multi-leg opacity)
+        - Destination adjacent to a sanctioned country (diversion risk)
+        - Unusually many transit stops (opacity indicator)
+    """
+
+    dimension = RiskDimension.CROSS_BORDER
+
+    def __init__(
+        self,
+        country_db: CountryRiskDatabase | None = None,
+        config: CrossBorderConfig | None = None,
+    ) -> None:
+        self._db = country_db
+        self._config = config or CrossBorderConfig()
+
+    def assess(self, ctx: DimensionContext) -> DimensionAssessment:
+        signals: list[DimensionSignal] = []
+        ship = ctx.shipment
+        cfg = self._config
+
+        route_codes = self._route_codes(ship)
+
+        # --- Signals from the country risk database ---
+        if self._db is not None:
+            for code, role in route_codes:
+                entry = self._db.get(code)
+                if entry is None:
+                    continue
+                country_name = entry.country_name or code
+
+                if entry.is_sanctioned:
+                    signals.append(
+                        DimensionSignal(
+                            name=f"sanctioned_{role}",
+                            value=1.0,
+                            weight=cfg.sanctioned_transit_weight,
+                            evidence=(
+                                f"Route includes sanctioned country "
+                                f"{country_name} ({code}) as {role} "
+                                f"[{entry.sanctions_status.value}]"
+                            ),
+                        )
+                    )
+                elif entry.is_fatf_listed:
+                    signals.append(
+                        DimensionSignal(
+                            name=f"fatf_listed_{role}",
+                            value=0.75 if entry.fatf_status == FatfStatus.BLACK else 0.55,
+                            weight=cfg.fatf_transit_weight,
+                            evidence=(
+                                f"Route includes FATF "
+                                f"{entry.fatf_status.value}-listed country "
+                                f"{country_name} ({code}) as {role}"
+                            ),
+                        )
+                    )
+                elif entry.overall_risk in (CountryRiskLevel.HIGH, CountryRiskLevel.CRITICAL):
+                    signals.append(
+                        DimensionSignal(
+                            name=f"high_risk_transit_{role}",
+                            value=_COUNTRY_RISK_VALUE[entry.overall_risk],
+                            weight=cfg.fatf_transit_weight,
+                            evidence=(
+                                f"Route includes high-risk country "
+                                f"{country_name} ({code}) as {role}"
+                            ),
+                        )
+                    )
+
+                if entry.transshipment_hub and role in ("transit", "destination"):
+                    signals.append(
+                        DimensionSignal(
+                            name=f"transshipment_hub_{role}",
+                            value=0.45,
+                            weight=cfg.transshipment_hub_weight,
+                            evidence=(
+                                f"Route uses known transshipment hub "
+                                f"{country_name} ({code}) as {role}"
+                            ),
+                        )
+                    )
+
+            # --- Diversion risk: destination adjacent to sanctioned country ---
+            dest_entry = self._db.get(ship.destination_country)
+            if dest_entry is not None and dest_entry.sanctioned_neighbors:
+                sanctioned_near = [
+                    n for n in dest_entry.sanctioned_neighbors
+                    if self._db.is_sanctioned(n)
+                ]
+                if sanctioned_near:
+                    signals.append(
+                        DimensionSignal(
+                            name="diversion_risk_sanctioned_neighbor",
+                            value=0.75,
+                            weight=cfg.diversion_neighbor_weight,
+                            evidence=(
+                                f"Destination {ship.destination_country} borders "
+                                f"sanctioned country/ies: {', '.join(sanctioned_near)} "
+                                f"(diversion risk)"
+                            ),
+                        )
+                    )
+
+        # --- Manufacture != origin (re-export or misdeclaration) ---
+        if (
+            ship.country_of_manufacture
+            and ship.origin_country
+            and ship.country_of_manufacture.upper() != ship.origin_country.upper()
+        ):
+            signals.append(
+                DimensionSignal(
+                    name="manufacture_origin_mismatch",
+                    value=0.55,
+                    weight=cfg.manufacture_origin_mismatch_weight,
+                    evidence=(
+                        f"Country of manufacture "
+                        f"({ship.country_of_manufacture.upper()}) differs from "
+                        f"country of origin ({ship.origin_country.upper()}) — "
+                        f"possible re-export pattern"
+                    ),
+                )
+            )
+
+        # --- Final destination differs from immediate destination ---
+        if (
+            ship.final_destination
+            and ship.destination_country
+            and ship.final_destination.upper() != ship.destination_country.upper()
+        ):
+            signals.append(
+                DimensionSignal(
+                    name="final_destination_mismatch",
+                    value=0.6,
+                    weight=cfg.final_destination_mismatch_weight,
+                    evidence=(
+                        f"Final destination "
+                        f"({ship.final_destination.upper()}) differs from "
+                        f"immediate destination "
+                        f"({ship.destination_country.upper()}) — "
+                        f"multi-leg shipment"
+                    ),
+                )
+            )
+            # If the final destination itself is sanctioned/high-risk, escalate
+            if self._db is not None:
+                final_entry = self._db.get(ship.final_destination)
+                if final_entry is not None and final_entry.is_sanctioned:
+                    signals.append(
+                        DimensionSignal(
+                            name="final_destination_sanctioned",
+                            value=1.0,
+                            weight=cfg.sanctioned_transit_weight,
+                            evidence=(
+                                f"Declared final destination "
+                                f"{ship.final_destination.upper()} is sanctioned "
+                                f"({final_entry.sanctions_status.value})"
+                            ),
+                        )
+                    )
+
+        # --- Opacity: many transit stops ---
+        n_transit = len(ship.transit_countries or [])
+        if n_transit >= cfg.many_transit_threshold:
+            signals.append(
+                DimensionSignal(
+                    name="many_transit_stops",
+                    value=min(0.3 + 0.15 * n_transit, 1.0),
+                    weight=cfg.many_transit_weight,
+                    evidence=(
+                        f"Shipment has {n_transit} transit stops — "
+                        f"route opacity is elevated"
+                    ),
+                )
+            )
+
+        score = _combine(signals)
+        severity = _severity_from_score(score)
+
+        # If any sanctioned-country or final-destination-sanctioned signal
+        # is present, force CRITICAL severity regardless of arithmetic.
+        if any(
+            s.name.startswith("sanctioned_") or s.name == "final_destination_sanctioned"
+            for s in signals
+        ):
+            severity = Severity.CRITICAL
+
+        summary = self._summary(signals, severity, ship)
+        return DimensionAssessment(
+            dimension=self.dimension,
+            severity=severity,
+            score=score,
+            signals=signals,
+            summary=summary,
+        )
+
+    @staticmethod
+    def _route_codes(ship: Shipment) -> list[tuple[str, str]]:
+        """Return (country_code, role) pairs for every leg of the route."""
+        pairs: list[tuple[str, str]] = []
+        if ship.origin_country:
+            pairs.append((ship.origin_country, "origin"))
+        for c in ship.transit_countries or []:
+            if c:
+                pairs.append((c, "transit"))
+        if ship.destination_country:
+            pairs.append((ship.destination_country, "destination"))
+        if ship.final_destination and (
+            not ship.destination_country
+            or ship.final_destination.upper() != ship.destination_country.upper()
+        ):
+            pairs.append((ship.final_destination, "final_destination"))
+        if ship.country_of_manufacture and (
+            not ship.origin_country
+            or ship.country_of_manufacture.upper() != ship.origin_country.upper()
+        ):
+            pairs.append((ship.country_of_manufacture, "manufacture"))
+        return pairs
+
+    @staticmethod
+    def _summary(signals, severity, ship) -> str:
+        if not signals:
+            return "No cross-border routing concerns detected."
+        hops: list[str] = []
+        if ship.origin_country:
+            hops.append(ship.origin_country.upper())
+        hops.extend([c.upper() for c in (ship.transit_countries or []) if c])
+        if ship.destination_country:
+            hops.append(ship.destination_country.upper())
+        if (
+            ship.final_destination
+            and (not ship.destination_country
+                 or ship.final_destination.upper() != ship.destination_country.upper())
+        ):
+            hops.append(f"→{ship.final_destination.upper()} (final)")
+        route = " → ".join(hops) if hops else "route unspecified"
+        return f"Cross-border risk {severity.value}: {route}."

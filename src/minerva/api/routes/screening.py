@@ -30,6 +30,10 @@ def _to_shipment(request: ScreenRequest) -> Shipment:
         declared_currency=request.declared_currency,
         hs_code=request.hs_code,
         weight_kg=request.weight_kg,
+        transit_countries=request.transit_countries,
+        country_of_manufacture=request.country_of_manufacture,
+        final_destination=request.final_destination,
+        incoterms=request.incoterms,
         metadata=request.metadata,
     )
 

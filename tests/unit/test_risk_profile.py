@@ -221,5 +221,5 @@ class TestProfileBuilderConfig:
 
     def test_missing_config_returns_defaults(self, tmp_path):
         config = ProfileBuilderConfig.from_json(tmp_path / "nothing.json")
-        # Defaults include all 8 dimensions
-        assert len(config.dimension_weights) == 8
+        # Defaults include every RiskDimension
+        assert len(config.dimension_weights) == len(RiskDimension)

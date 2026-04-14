@@ -13,8 +13,11 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from minerva.risk.country_risk import CountryRiskDatabase
 from minerva.risk.dimensions import (
     BaseAssessor,
+    CrossBorderAssessor,
+    CrossBorderConfig,
     DataQualityAssessor,
     DimensionContext,
     DualUseAssessor,
@@ -57,6 +60,7 @@ class ProfileBuilderConfig:
             RiskDimension.DATA_QUALITY: 0.8,
             RiskDimension.MODEL_UNCERTAINTY: 1.0,
             RiskDimension.DUAL_USE: 1.3,
+            RiskDimension.CROSS_BORDER: 2.0,
         }
     )
 
@@ -287,17 +291,24 @@ def default_assessors(
     valuation_config: ValuationConfig | None = None,
     hs_code_config: HsCodeConfig | None = None,
     dual_use_config: DualUseConfig | None = None,
+    cross_border_config: CrossBorderConfig | None = None,
+    country_db: CountryRiskDatabase | None = None,
 ) -> list[BaseAssessor]:
-    """Build the default set of 8 dimension assessors."""
+    """Build the default set of 9 dimension assessors.
+
+    If `country_db` is provided (e.g. loaded from LexisNexis), it is
+    shared by the Geography and CrossBorder assessors for richer signals.
+    """
     return [
         GoodsAssessor(),
         PartyAssessor(),
-        GeographyAssessor(geography_config),
+        GeographyAssessor(geography_config, country_db=country_db),
         ValuationAssessor(valuation_config),
         HsCodeAssessor(hs_code_config),
         DataQualityAssessor(),
         ModelUncertaintyAssessor(),
         DualUseAssessor(dual_use_config),
+        CrossBorderAssessor(country_db=country_db, config=cross_border_config),
     ]
 
 
