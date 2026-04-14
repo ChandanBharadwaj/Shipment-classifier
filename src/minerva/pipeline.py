@@ -25,6 +25,7 @@ from minerva.entity_resolution.denied_party_list import load_denied_parties
 from minerva.entity_resolution.resolver import EntityResolver, EntityResolverConfig
 from minerva.explain.rationale import TemplatedRationaleGenerator, attach_rationale
 from minerva.logging_utils import get_logger, log_disagreement
+from minerva.risk.ai_engine import AIRiskEngine, AISignals
 from minerva.risk.country_risk import CountryRiskDatabase, load_country_risk
 from minerva.risk.dimensions import (
     CrossBorderConfig,
@@ -143,6 +144,24 @@ class ScreeningPipeline:
                 settings.country_risk_path,
             )
 
+        # AI risk engine — shares the embedding model for HS prediction,
+        # semantic dual-use similarity, and description-HS coherence.
+        self._ai_engine: AIRiskEngine | None = None
+        if settings.ai_engine.enabled:
+            self._ai_engine = AIRiskEngine(
+                embedding_model=self._embedding_model,
+                hs_top_k=settings.ai_engine.hs_top_k,
+                dual_use_similarity_threshold=settings.ai_engine.dual_use_similarity_threshold,
+            )
+            logger.info(
+                "AI risk engine ready (%d HS chapters, %d dual-use concepts, "
+                "top-k=%d, dual-use threshold=%.2f)",
+                len(self._ai_engine.hs_chapter_codes),
+                len(self._ai_engine.dual_use_concepts),
+                self._ai_engine.hs_top_k,
+                self._ai_engine.dual_use_threshold,
+            )
+
         # Multi-dimensional risk profile builder (always enabled)
         self._profile_builder = self._build_profile_builder(
             risk_config, settings, self._country_db
@@ -243,11 +262,21 @@ class ScreeningPipeline:
             self._entity_resolver.resolve_shipment(shipment)
             if self._entity_resolver else []
         )
+        # AI signals (optional)
+        ai_signals: AISignals | None = None
+        if self._ai_engine is not None:
+            ai_batch = self._ai_engine.build_ai_signals_batch(
+                descriptions=[shipment.description],
+                hs_codes=[shipment.hs_code],
+            )
+            ai_signals = ai_batch[0] if ai_batch else None
+
         ctx = DimensionContext(
             shipment=shipment,
             taxonomy_hits=tax_hits,
             classification=cls_result,
             entity_matches=entity_matches,
+            ai_signals=ai_signals,
         )
         return self._profile_builder.build(ctx)
 
@@ -274,6 +303,18 @@ class ScreeningPipeline:
         if self._risk_scorer is not None:
             risk_results = self._risk_scorer.score_batch(shipments)
 
+        # AI signals (HS prediction, semantic dual-use, coherence)
+        ai_signals_batch: list[AISignals | None]
+        if self._ai_engine is not None:
+            ai_signals_batch = list(
+                self._ai_engine.build_ai_signals_batch(
+                    descriptions=descriptions,
+                    hs_codes=[s.hs_code for s in shipments],
+                )
+            )
+        else:
+            ai_signals_batch = [None] * len(shipments)
+
         # Layer 3: Routing (advisory action)
         decisions = route_batch(
             shipments=shipments,
@@ -291,12 +332,14 @@ class ScreeningPipeline:
                 taxonomy_hits=t,
                 classification=c,
                 entity_matches=(e if entity_results else []),
+                ai_signals=ai,
             )
-            for s, t, c, e in zip(
+            for s, t, c, e, ai in zip(
                 shipments,
                 taxonomy_results,
                 classification_results,
                 entity_results if entity_results else [[] for _ in shipments],
+                ai_signals_batch,
                 strict=True,
             )
         ]

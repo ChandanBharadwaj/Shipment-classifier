@@ -38,6 +38,19 @@ The system does not take action — it **surfaces risk across 8 dimensions** and
 
 Drop your LexisNexis WorldCompliance / CLEAR export into `config/country_risk.json` (Minerva native) or `config/country_risk.csv` (column names configurable). The database is shared by the `geography` and `cross_border` dimensions. Fields captured per country include overall risk tier/score, sanctions status (comprehensive/sectoral), FATF status (grey/black), transshipment-hub flag, and sanctioned-neighbor list (for diversion-risk detection).
 
+### AI risk engine (no extra models)
+
+An `AIRiskEngine` reuses the single embedding model already loaded for taxonomy matching to power AI signals in three dimensions. No new downloads, no extra API calls.
+
+| Where | AI signal | What it catches |
+|-------|-----------|-----------------|
+| `hs_code` | `hs_declared_not_in_top_k` | Declared HS chapter is absent from AI's top-k predictions |
+| `hs_code` | `hs_low_declared_similarity` | Declared chapter present in top-k but with low semantic similarity |
+| `dual_use` | `ai_dual_use_match` | Description semantically matches dual-use concept phrases (catches paraphrases) |
+| `data_quality` | `description_hs_incoherent` | Description is semantically far from declared HS chapter |
+
+Evidence surfaced to the officer includes concrete cosine similarity scores and predicted chapter titles — fully auditable. Toggle via `ai_engine.enabled` in settings.
+
 Each dimension produces `severity` (none/low/medium/high/critical), a `score`, and **evidence signals** with human-readable explanations. **Hard flags** (exact denied-party match, taxonomy keyword hit) are surfaced independently of dimension scores. An `advisory_action` is emitted as a non-binding suggestion; the officer owns the final call.
 
 ```

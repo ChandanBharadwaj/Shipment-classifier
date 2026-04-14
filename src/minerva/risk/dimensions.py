@@ -23,11 +23,13 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
+from minerva.risk.ai_engine import AISignals
 from minerva.risk.country_risk import (
     CountryRiskDatabase,
     CountryRiskLevel,
     FatfStatus,
 )
+from minerva.risk.hs_chapters import chapter_title, get_chapter
 from minerva.schema import (
     ClassificationResult,
     ClassifierLabel,
@@ -49,6 +51,7 @@ class DimensionContext:
     taxonomy_hits: list[TaxonomyHit] = field(default_factory=list)
     classification: ClassificationResult | None = None
     entity_matches: list[EntityMatch] = field(default_factory=list)
+    ai_signals: AISignals | None = None
 
 
 class BaseAssessor(ABC):
@@ -554,9 +557,19 @@ class ValuationAssessor(BaseAssessor):
 @dataclass
 class HsCodeConfig:
     sensitive_prefixes: list[str] = field(default_factory=list)
+    # AI signal thresholds
+    mismatch_similarity_drop: float = 0.15  # declared - top-1 gap triggers mismatch
+    low_declared_similarity: float = 0.30  # absolute similarity below this is suspicious
 
 
 class HsCodeAssessor(BaseAssessor):
+    """HS code risk — rule-based checks augmented with AI chapter prediction.
+
+    AI signals (when AISignals present on context):
+      - `hs_declared_not_in_top_k`: declared chapter not in AI top-k predictions
+      - `hs_low_declared_similarity`: declared chapter semantic similarity is low
+    """
+
     dimension = RiskDimension.HS_CODE
 
     def __init__(self, config: HsCodeConfig | None = None) -> None:
@@ -601,6 +614,9 @@ class HsCodeAssessor(BaseAssessor):
                     )
                     break
 
+        # ---- AI signals ----
+        signals.extend(self._ai_signals(ctx, hs))
+
         score = _combine(signals)
         severity = _severity_from_score(score)
         summary = self._summary(signals, severity, hs)
@@ -617,6 +633,75 @@ class HsCodeAssessor(BaseAssessor):
         if not signals:
             return f"HS code {hs} presents no elevated concerns."
         return f"HS code risk {severity.value}."
+
+    def _ai_signals(self, ctx: DimensionContext, hs: str | None) -> list[DimensionSignal]:
+        """Compare declared HS chapter against AI chapter predictions.
+
+        Two distinct signals may fire:
+          1. Declared chapter is absent from the AI top-k predictions →
+             strong mismatch indication
+          2. Declared chapter is in top-k but at low absolute similarity →
+             weaker indication of poor description-HS alignment
+        """
+        ai = ctx.ai_signals
+        if ai is None or not ai.hs_predictions:
+            return []
+
+        declared_chapter = get_chapter(hs)
+        if declared_chapter is None:
+            # Already captured by missing_hs_code / malformed_hs_code above
+            return []
+
+        signals: list[DimensionSignal] = []
+        predicted_chapters = [p.chapter for p in ai.hs_predictions]
+        top1 = ai.hs_predictions[0]
+
+        if declared_chapter not in predicted_chapters:
+            # Strong mismatch: AI's top-k doesn't include declared chapter
+            gap = top1.similarity - (ai.declared_hs_similarity or 0.0)
+            gap = max(gap, 0.0)
+            top_k_str = ", ".join(
+                f"{p.chapter} ({chapter_title(p.chapter) or '?'}: {p.similarity:.2f})"
+                for p in ai.hs_predictions
+            )
+            declared_title = chapter_title(declared_chapter) or "unknown"
+            sim_str = (
+                f"{ai.declared_hs_similarity:.2f}"
+                if ai.declared_hs_similarity is not None
+                else "n/a"
+            )
+            signals.append(
+                DimensionSignal(
+                    name="hs_declared_not_in_top_k",
+                    value=min(0.5 + gap * 1.5, 1.0),
+                    weight=2.0,
+                    evidence=(
+                        f"Declared HS chapter {declared_chapter} ({declared_title}) "
+                        f"is not in AI top-{len(ai.hs_predictions)} predictions. "
+                        f"AI top-{len(ai.hs_predictions)}: [{top_k_str}]. "
+                        f"Declared chapter similarity: {sim_str}"
+                    ),
+                )
+            )
+        elif (
+            ai.declared_hs_similarity is not None
+            and ai.declared_hs_similarity < self._config.low_declared_similarity
+        ):
+            declared_title = chapter_title(declared_chapter) or "unknown"
+            signals.append(
+                DimensionSignal(
+                    name="hs_low_declared_similarity",
+                    value=min(0.3 + (self._config.low_declared_similarity - ai.declared_hs_similarity) * 2, 1.0),
+                    weight=1.0,
+                    evidence=(
+                        f"Declared HS chapter {declared_chapter} ({declared_title}) "
+                        f"has low semantic similarity to description "
+                        f"({ai.declared_hs_similarity:.2f})"
+                    ),
+                )
+            )
+
+        return signals
 
 
 # --- 6. DATA QUALITY ----------------------------------------------------
@@ -700,6 +785,35 @@ class DataQualityAssessor(BaseAssessor):
                     ),
                 )
             )
+
+        # ---- AI description ↔ declared HS coherence ----
+        # If the declared HS chapter is semantically far from the description,
+        # raise an incoherence signal. Orthogonal from hs_code dimension
+        # signals: that surfaces the HS chapter mismatch; this surfaces the
+        # shipment record as internally incoherent.
+        ai = ctx.ai_signals
+        if (
+            ai is not None
+            and ai.declared_hs_similarity is not None
+            and ship.hs_code
+        ):
+            sim = ai.declared_hs_similarity
+            if sim < 0.35:
+                from minerva.risk.hs_chapters import chapter_title, get_chapter
+                ch = get_chapter(ship.hs_code)
+                title = chapter_title(ch) if ch else None
+                signals.append(
+                    DimensionSignal(
+                        name="description_hs_incoherent",
+                        value=min(0.3 + (0.35 - sim) * 2, 1.0),
+                        weight=1.0,
+                        evidence=(
+                            f"Description is semantically incoherent with "
+                            f"declared HS chapter {ch} ({title or 'unknown'}) — "
+                            f"coherence score {sim:.2f}"
+                        ),
+                    )
+                )
 
         score = _combine(signals)
         severity = _severity_from_score(score)
@@ -866,6 +980,29 @@ class DualUseAssessor(BaseAssessor):
                         ),
                     )
                 )
+
+        # ---- AI semantic similarity to dual-use concept phrases ----
+        # Complements keyword matching: catches paraphrases, novel wordings
+        if ctx.ai_signals is not None and ctx.ai_signals.dual_use_similarities:
+            top_matches = ctx.ai_signals.dual_use_similarities[:3]
+            top = top_matches[0]
+            # Map similarity 0.55-0.85 → signal value 0.5-1.0
+            value = min(0.5 + (top.similarity - 0.55) * 3.0, 1.0)
+            value = max(value, 0.5)
+            concept_str = "; ".join(
+                f"'{m.concept}' ({m.similarity:.2f})" for m in top_matches
+            )
+            signals.append(
+                DimensionSignal(
+                    name="ai_dual_use_match",
+                    value=value,
+                    weight=1.8,
+                    evidence=(
+                        f"Description is semantically similar to dual-use "
+                        f"concept(s): {concept_str}"
+                    ),
+                )
+            )
 
         score = _combine(signals)
         severity = _severity_from_score(score)

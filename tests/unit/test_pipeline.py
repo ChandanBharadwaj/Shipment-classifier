@@ -36,6 +36,7 @@ class TestScreeningPipeline:
             patch("minerva.pipeline.load_taxonomy") as MockLoad,
             patch("minerva.pipeline.TaxonomyEmbeddingIndex") as MockIndex,
             patch("minerva.pipeline.TaxonomyMatcher") as MockMatcher,
+            patch("minerva.pipeline.AIRiskEngine") as MockAI,
         ):
             import numpy as np
             from minerva.schema import TaxonomyGroup
@@ -72,6 +73,17 @@ class TestScreeningPipeline:
                 for _ in range(10)
             ]
             MockNLI.return_value = mock_nli
+
+            # Mock AI risk engine — returns one None AISignals per description
+            mock_ai = MagicMock()
+            mock_ai.hs_chapter_codes = []
+            mock_ai.dual_use_concepts = []
+            mock_ai.hs_top_k = 3
+            mock_ai.dual_use_threshold = 0.55
+            mock_ai.build_ai_signals_batch.side_effect = (
+                lambda descriptions, hs_codes, **kw: [None] * len(descriptions)
+            )
+            MockAI.return_value = mock_ai
 
             from minerva.pipeline import ScreeningPipeline
 

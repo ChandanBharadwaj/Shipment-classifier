@@ -34,6 +34,15 @@ class DriftMonitoringConfig(BaseSettings):
     psi_alert: float = 0.25
 
 
+class AIEngineConfig(BaseSettings):
+    """AI risk engine — HS prediction, semantic dual-use, coherence."""
+
+    enabled: bool = True
+    hs_top_k: int = 3
+    dual_use_similarity_threshold: float = 0.55
+    coherence_low_threshold: float = 0.35
+
+
 class NLIHypotheses(BaseSettings):
     allowed: str = "This shipment is allowed for export without restrictions."
     restricted: str = "This shipment contains restricted or controlled items."
@@ -65,6 +74,7 @@ class MinervaSettings(BaseSettings):
     drift_monitoring: DriftMonitoringConfig = Field(
         default_factory=DriftMonitoringConfig
     )
+    ai_engine: AIEngineConfig = Field(default_factory=AIEngineConfig)
     nli_hypotheses: NLIHypotheses = Field(default_factory=NLIHypotheses)
 
     @property
